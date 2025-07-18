@@ -1,7 +1,7 @@
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from datetime import datetime
-from io import BytesIO
+import io
 
 # Konfiguration
 PAUSE_START = pd.Timestamp("2025-01-01")
@@ -18,8 +18,9 @@ STUFEN_BEITRAEGE = {
     "Stufe 7": 280
 }
 
-# Hilfsfunktionen
 def runde_auf_monatsersten(datum):
+    if pd.isnull(datum):
+        return pd.NaT
     if datum.day < 15:
         return pd.Timestamp(datum.year, datum.month, 1)
     else:
@@ -27,19 +28,21 @@ def runde_auf_monatsersten(datum):
         monat = 1 if datum.month == 12 else datum.month + 1
         return pd.Timestamp(jahr, monat, 1)
 
-def berechne_wartezeit(datum):
-    if pd.isnull(datum):
+def berechne_wartezeit(eintrittsdatum):
+    if pd.isnull(eintrittsdatum):
         return pd.NaT
-    gerundet = runde_auf_monatsersten(datum)
-    erfuellt = gerundet + pd.DateOffset(months=6)
-    return max(erfuellt, WARTEZEIT_MIN_DATUM)
+    berechnet = eintrittsdatum + pd.DateOffset(months=6)
+    berechnet = pd.Timestamp(berechnet.year, berechnet.month, 1)
+    if berechnet < WARTEZEIT_MIN_DATUM:
+        return WARTEZEIT_MIN_DATUM
+    return berechnet
 
-def berechne_stufe(wartezeit, heute=STAND_DATUM):
-    if pd.isnull(wartezeit) or wartezeit > heute:
+def berechne_stufe_mit_pause(wartezeit_erfuellt_am, heute=STAND_DATUM):
+    if pd.isnull(wartezeit_erfuellt_am) or wartezeit_erfuellt_am > heute:
         return "Stufe 1"
     stufe = 1
     for i in range(1, 7):
-        erhöhung = wartezeit + pd.DateOffset(years=i)
+        erhöhung = wartezeit_erfuellt_am + pd.DateOffset(years=i)
         if PAUSE_START <= erhöhung <= PAUSE_END:
             erhöhung = pd.Timestamp("2025-07-01")
         if erhöhung <= heute:
@@ -55,7 +58,8 @@ def pruefe_verschiebung(stufenbeginn, stufe):
         nummer = int(stufe.split()[-1])
     except:
         return ""
-    for i in range(0, 7 - nummer + 1):
+
+    for i in range(nummer - 1):  # -1, da Stufe 1 keine Erhöhung ist
         erhöhung = stufenbeginn + pd.DateOffset(years=i)
         if PAUSE_START <= erhöhung <= PAUSE_END:
             return "Verschiebung auf 01.07."
@@ -79,20 +83,16 @@ def vergleiche_beitrag(soll, ist):
     else:
         return "Keine Aktion erforderlich"
 
-# Streamlit GUI
-st.set_page_config(page_title="Sentiris bAV-Tool", layout="centered")
-st.title("📊 Sentiris bAV – Automatisierungstool")
-
-st.write("Lade eine Excel- oder CSV-Datei hoch:")
-
-uploaded_file = st.file_uploader("Datei hochladen", type=["xlsx", "csv"])
-
-if uploaded_file:
+def verarbeite_datei(uploaded_file):
     try:
-        if uploaded_file.name.endswith(".csv"):
+        dateiname = uploaded_file.name.lower()
+        if dateiname.endswith(".xlsx"):
+            df = pd.read_excel(uploaded_file)
+        elif dateiname.endswith(".csv"):
             df = pd.read_csv(uploaded_file, sep=None, engine='python')
         else:
-            df = pd.read_excel(uploaded_file)
+            st.error("Nur .xlsx oder .csv Dateien werden unterstützt.")
+            return None
 
         df["Diensteintrittsdatum"] = pd.to_datetime(df["Diensteintrittsdatum"], errors="coerce")
         df["Fehlermeldung"] = ""
@@ -102,37 +102,49 @@ if uploaded_file:
 
         df.loc[mask_valid, "Wartezeit erfüllt am"] = df.loc[mask_valid, "Diensteintrittsdatum"].apply(berechne_wartezeit)
         df.loc[mask_valid, "Stufenbeginn am"] = df.loc[mask_valid, "Wartezeit erfüllt am"] + pd.DateOffset(months=12)
-        df.loc[mask_valid, "Aktuelle Stufe"] = df.loc[mask_valid, "Wartezeit erfüllt am"].apply(berechne_stufe)
+        df.loc[mask_valid, "Aktuelle Stufe"] = df.loc[mask_valid, "Wartezeit erfüllt am"].apply(berechne_stufe_mit_pause)
+
         df.loc[mask_valid, "Info"] = df.loc[mask_valid].apply(
             lambda row: pruefe_verschiebung(row["Stufenbeginn am"], row["Aktuelle Stufe"]),
             axis=1
         )
 
         df.loc[mask_valid, "Beitrag laut Stufe"] = df.loc[mask_valid, "Aktuelle Stufe"].map(STUFEN_BEITRAEGE).fillna(0)
+
         df["Beitrag laut Stufe (bereinigt)"] = df["Beitrag laut Stufe"].apply(bereinige_beitrag)
         df["Beitrag laut Allianz Vertrag (bereinigt)"] = df["Beitrag laut Allianz Vertrag"].apply(bereinige_beitrag)
+
         df["Anstehende Aktion"] = df.apply(
             lambda row: vergleiche_beitrag(row["Beitrag laut Stufe (bereinigt)"], row["Beitrag laut Allianz Vertrag (bereinigt)"]),
             axis=1
         )
 
-        # Nur relevante Spalten exportieren
-        export_df = df.drop(columns=["Beitrag laut Stufe (bereinigt)", "Beitrag laut Allianz Vertrag (bereinigt)"], errors="ignore")
-
-        # Ergebnis anzeigen
-        st.success("✅ Datei erfolgreich verarbeitet!")
-        st.dataframe(export_df)
-
-        # Download ermöglichen
-        excel_buffer = BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine='openpyxl', date_format="DD.MM.YYYY") as writer:
-            export_df.to_excel(writer, index=False)
-        st.download_button(
-            label="📥 Ergänzte Datei herunterladen",
-            data=excel_buffer.getvalue(),
-            file_name="sentiris_auswertung.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        return df
 
     except Exception as e:
-        st.error(f"❌ Fehler bei der Verarbeitung:\n{e}")
+        st.error(f"Fehler bei der Verarbeitung: {e}")
+        return None
+
+# Streamlit App
+st.set_page_config(page_title="bAV-Tool – Sentiris", layout="centered")
+st.title("📊 bAV-Tool – Sentiris Automatisierung")
+
+uploaded_file = st.file_uploader("Lade eine Excel- oder CSV-Datei hoch:", type=["xlsx", "csv"])
+
+if uploaded_file:
+    df = verarbeite_datei(uploaded_file)
+    if df is not None:
+        st.success("✅ Datei erfolgreich verarbeitet.")
+        export_df = df.drop(columns=["Beitrag laut Stufe (bereinigt)", "Beitrag laut Allianz Vertrag (bereinigt)"], errors="ignore")
+
+        st.dataframe(export_df)
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl', date_format="DD.MM.YYYY") as writer:
+            export_df.to_excel(writer, index=False)
+        st.download_button(
+            label="💾 Ergänzte Datei herunterladen",
+            data=output.getvalue(),
+            file_name="verarbeitet.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
